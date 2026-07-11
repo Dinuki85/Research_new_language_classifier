@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# ── CodeRefactor AI — Pre-Commit Hook ────────────────────────────────────────
+#
+# Automatically analyzes staged Python files for code smells and refactors
+# bad-smell functions before each commit.
+#
+# Installation:
+#   python src/setup_hooks.py
+#   # or manually: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Environment variables:
+#   OPENROUTER_API_KEY    Required for refactoring (API key)
+#   CODEREFACTOR_DRY_RUN  Set to "1" for analysis only (no refactoring)
+#   CODEREFACTOR_SKIP     Set to "1" to skip this hook entirely
+#
+# Behavior:
+#   1. Finds all staged Python files
+#   2. Runs CodeRefactor AI on those files (--dry-run if CODEREFACTOR_DRY_RUN=1)
+#   3. If bad smells found and not dry-run, refactors them in-place
+#   4. Re-stages refactored files
+#   5. Prints detailed results to stdout
+# ──────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── Skip if requested ────────────────────────────────────────────────────────
+if [ "${CODEREFACTOR_SKIP:-}" = "1" ]; then
+    echo "[CodeRefactor AI] SKIPPED (CODEREFACTOR_SKIP=1)"
+    exit 0
+fi
+
+# ── Find the project root (where cli.py lives) ───────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLI_SCRIPT="$PROJECT_ROOT/cli.py"
+
+if [ ! -f "$CLI_SCRIPT" ]; then
+    echo "[CodeRefactor AI] ⚠ cli.py not found at $CLI_SCRIPT — skipping hook"
+    exit 0
+fi
+
+# ── ML Language Detection ────────────────────────────────────────────────────
+echo "[CodeRefactor AI] Checking repository language with ML model..."
+python "$PROJECT_ROOT/src/language_detection.py" || {
+  echo "[CodeRefactor AI] Commit aborted: Non-Python repository detected."
+  exit 1
+}
+
+# ── Find staged Python files ─────────────────────────────────────────────────
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "[CodeRefactor AI] No staged Python files to analyze."
+    exit 0
+fi
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║     CodeRefactor AI — Auto-Refactoring Pre-Commit Hook           ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo ""
+echo "Staged Python files:"
+for f in $STAGED_FILES; do
+    echo "  • $f"
+done
+echo ""
+
+# Convert relative paths to absolute
+FILES_ARGS=""
+for f in $STAGED_FILES; do
+    FILES_ARGS="$FILES_ARGS \"$PROJECT_ROOT/$f\""
+done
+
+# ── Run the analysis ─────────────────────────────────────────────────────────
+if [ "${CODEREFACTOR_DRY_RUN:-}" = "1" ]; then
+    echo "[CodeRefactor AI] Running in DRY-RUN mode (analysis only)..."
+    echo ""
+    eval python "$CLI_SCRIPT" --files $FILES_ARGS --dry-run --json --verbose
+    echo ""
+    echo "[CodeRefactor AI] ✅ Analysis complete. Check details above."
+else
+    echo "[CodeRefactor AI] Running analysis + refactoring..."
+    echo ""
+
+    # First run with --json to save report (dry-run first to show smells)
+    eval python "$CLI_SCRIPT" --files $FILES_ARGS --in-place --json --verbose 2>&1 || true
+
+    echo ""
+    echo "[CodeRefactor AI] ✅ Refactoring complete."
+    echo ""
+
+    # ── Interactive Review & Re-stage ─────────────────────────────────────────
+    for f in $STAGED_FILES; do
+        if [ -f "$PROJECT_ROOT/$f" ]; then
+            # Check if the file was actually modified by the AI
+            if ! git diff --quiet "$PROJECT_ROOT/$f"; then
+                echo "──────────────────────────────────────────────────────────────────────"
+                echo "[CodeRefactor AI] Changes made to $f:"
+               # git diff --color "$PROJECT_ROOT/$f"
+                echo "──────────────────────────────────────────────────────────────────────"
+                
+                # Ask the user for permission (Reading from /dev/tty connects to keyboard)
+                exec < /dev/tty
+                read -p "Do you want to accept these AI refactoring changes? (y/n) " accept
+                
+                if [ "$accept" = "y" ] || [ "$accept" = "Y" ]; then
+                    git add "$PROJECT_ROOT/$f"
+                    echo "[CodeRefactor AI] Changes accepted and staged: $f"
+                else
+                    echo "[CodeRefactor AI] Changes rejected for $f. Reverting to pre-refactor state..."
+                    git checkout "$PROJECT_ROOT/$f"
+                    echo "[CodeRefactor AI] Proceeding with commit using the original code."
+                    # exit 1  <-- Delete this or put a # in front of it!
+                fi
+
+            else
+                # No changes made by the AI, just re-stage to be safe
+                git add "$PROJECT_ROOT/$f"
+            fi
+        fi
+    done
+
+    echo ""
+    echo "[CodeRefactor AI] ✅ Review complete."
+fi
+
+# ── Show report path if available ────────────────────────────────────────────
+REPORT_FILE="$PROJECT_ROOT/refactor-report.json"
+if [ -f "$REPORT_FILE" ]; then
+    echo "[CodeRefactor AI] Report: $REPORT_FILE"
+fi
+
+echo ""
